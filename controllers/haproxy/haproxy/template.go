@@ -50,7 +50,7 @@ func (ha *Manager) WriteCfg(cfg config.Configuration, ingressCfg IngressConfig) 
 		if err != nil {
 			glog.Errorf("unexpected error:", err)
 		}
-		glog.Infof("NGINX configuration: %v", string(b))
+		glog.Infof("Haproxy configuration: %v", string(b))
 	}
 	buffer := new(bytes.Buffer)
 	err := ha.template.Execute(buffer, conf)

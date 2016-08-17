@@ -19,8 +19,8 @@ type Manager struct {
 	ConfigFile        string
 	PidFile           string
 	reloadRateLimiter flowcontrol.RateLimiter
-	template          *template.Template
 	reloadLock        *sync.Mutex
+	template          *template.Template
 }
 
 func NewManager() *Manager {

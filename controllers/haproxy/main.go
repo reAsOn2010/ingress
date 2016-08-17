@@ -21,11 +21,14 @@ var (
 	inCluster = flags.Bool("running-in-cluster", true,
 		`Optional, if this controller is running in a kubernetes cluster, use the
 		 pod secrets for creating a Kubernetes client.`)
-	// kubeConfig = flags.String("kubeconfig", "", "Path to the kubeconfig file to use for CLI requests.")
 	watchNamespace = flags.String("watch-namespace", api.NamespaceAll,
 		`Namespace to watch for Ingress. Default is to watch all namespaces`)
 	resyncPeriod = flags.Duration("sync-period", 30*time.Second,
 		`Relist and confirm cloud resources this often.`)
+	enableKeepalived   = flags.Bool("enable-keepalived", false, `Run keepalived`)
+	keepalivedPeerName = flags.String("keepalived-peer-name", "haproxy-ingress", `Keepalived peer name`)
+	keepalivedPriority = flags.Int("keepalived-periority", 100, `Keepalived priority`)
+	virtualIp          = flags.String("keepalived-vip", "10.0.0.1", `Keepalived virtual ip`)
 )
 
 func main() {
@@ -51,7 +54,7 @@ func main() {
 		glog.Fatalf("failed to create client: %v", err)
 	}
 
-	lbc, err := newLoadBalancerController(kubeClient, *resyncPeriod, *watchNamespace)
+	lbc, err := newLoadBalancerController(kubeClient, *resyncPeriod, *watchNamespace, *enableKeepalived, *keepalivedPeerName, *keepalivedPriority, *virtualIp)
 	if err != nil {
 		glog.Fatalf("%v", err)
 	}

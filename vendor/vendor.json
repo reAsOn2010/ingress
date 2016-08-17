@@ -213,6 +213,12 @@
 			"revisionTime": "2016-07-17T18:23:45Z"
 		},
 		{
+			"checksumSHA1": "KCWVxG+J8SxHGlGiUghe0KBGsa8=",
+			"path": "github.com/fatih/structs",
+			"revision": "dc3312cb1a4513a366c4c9e622ad55c32df12ed3",
+			"revisionTime": "2016-08-07T23:55:29Z"
+		},
+		{
 			"checksumSHA1": "17vYJDDMJO63/G/tRFIUuSlMCbE=",
 			"origin": "k8s.io/kubernetes/vendor/github.com/ghodss/yaml",
 			"path": "github.com/ghodss/yaml",
@@ -1312,5 +1318,5 @@
 			"revisionTime": "2016-07-17T18:23:45Z"
 		}
 	],
-	"rootPath": "github.com/caicloud/ingress"
+	"rootPath": "github.com/reAsOn2010/ingress"
 }

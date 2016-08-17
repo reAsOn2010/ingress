@@ -1,0 +1,25 @@
+vrrp_script chk_haproxy {
+    script "pidof haproxy"
+    interval 2
+}
+
+vrrp_instance VI_1 {
+    interface eth1
+    state SLAVE
+    priority {{ .Priority }}
+
+    virtual_router_id 33
+    unicast_src_ip {{ .SrcIp }}
+    unicast_peer {
+    {{ range $peer := .Peers }}
+        {{ $peer }}
+    {{ end }}
+    }
+
+    authentication {
+        auth_type PASS
+        auth_pass caicloud2015ABC
+    }
+
+    notify_master /etc/keepalived/master.sh
+}

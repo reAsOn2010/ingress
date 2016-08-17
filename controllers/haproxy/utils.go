@@ -16,6 +16,10 @@ type StoreToIngressLister struct {
 	cache.Store
 }
 
+type StoreToPodLister struct {
+	cache.Store
+}
+
 type ingAnnotations map[string]string
 
 func (ing ingAnnotations) ingressClass() string {

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"reflect"
 	"strconv"
 	"sync"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/golang/glog"
 	"github.com/reAsOn2010/ingress/controllers/haproxy/haproxy"
+	"github.com/reAsOn2010/ingress/controllers/haproxy/keepalived"
 
 	"k8s.io/kubernetes/pkg/api"
 	podutil "k8s.io/kubernetes/pkg/api/pod"
@@ -63,32 +65,43 @@ type loadBalancerController struct {
 	ingController  *framework.Controller
 	svcController  *framework.Controller
 	endpController *framework.Controller
+	podController  *framework.Controller
 	ingLister      StoreToIngressLister
 	svcLister      cache.StoreToServiceLister
 	endpLister     cache.StoreToEndpointsLister
+	podLister      StoreToPodLister
 	haproxy        *haproxy.Manager
 	syncQueue      *taskQueue
 	ingQueue       *taskQueue
+	podQueue       *taskQueue
+	recorder       record.EventRecorder
+	stopLock       sync.Mutex
+	shutdown       bool
+	stopCh         chan struct{}
 
-	recorder record.EventRecorder
-
-	stopLock sync.Mutex
-	shutdown bool
-	stopCh   chan struct{}
+	keepalived         *keepalived.Manager
+	enableKeepalived   bool
+	keepalivedPriority int
+	virtualIp          string
 }
 
-func newLoadBalancerController(kubeClient *client.Client, resyncPeriod time.Duration, namespace string) (*loadBalancerController, error) {
+func newLoadBalancerController(kubeClient *client.Client, resyncPeriod time.Duration, namespace string, enableKeepalived bool, keepalivedPeerName string, keepalivedPriority int, virtualIp string) (*loadBalancerController, error) {
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartLogging(glog.Infof)
 	eventBroadcaster.StartRecordingToSink(kubeClient.Events(namespace))
 	lbc := loadBalancerController{
-		client:   kubeClient,
-		haproxy:  haproxy.NewManager(),
-		stopCh:   make(chan struct{}),
-		recorder: eventBroadcaster.NewRecorder(api.EventSource{Component: "haproxy-ingress-controller"}),
+		client:             kubeClient,
+		haproxy:            haproxy.NewManager(),
+		keepalived:         keepalived.NewManager(),
+		stopCh:             make(chan struct{}),
+		recorder:           eventBroadcaster.NewRecorder(api.EventSource{Component: "haproxy-ingress-controller"}),
+		enableKeepalived:   enableKeepalived,
+		keepalivedPriority: keepalivedPriority,
+		virtualIp:          virtualIp,
 	}
 	lbc.syncQueue = NewTaskQueue(lbc.sync)
 	lbc.ingQueue = NewTaskQueue(lbc.updateIngressStatus)
+	lbc.podQueue = NewTaskQueue(lbc.syncKeepalived)
 	ingEventHandler := framework.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			addIng := obj.(*extensions.Ingress)
@@ -137,6 +150,20 @@ func newLoadBalancerController(kubeClient *client.Client, resyncPeriod time.Dura
 		},
 	}
 
+	podEventHandler := framework.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			lbc.podQueue.enqueue(obj)
+		},
+		DeleteFunc: func(obj interface{}) {
+			lbc.podQueue.enqueue(obj)
+		},
+		UpdateFunc: func(old, cur interface{}) {
+			if !reflect.DeepEqual(old, cur) {
+				lbc.podQueue.enqueue(cur)
+			}
+		},
+	}
+
 	lbc.ingLister.Store, lbc.ingController = framework.NewInformer(
 		&cache.ListWatch{
 			ListFunc:  ingressListFunc(lbc.client, namespace),
@@ -155,7 +182,30 @@ func newLoadBalancerController(kubeClient *client.Client, resyncPeriod time.Dura
 			WatchFunc: endpointsWatchFunc(lbc.client, namespace),
 		},
 		&api.Endpoints{}, resyncPeriod, eventHandler)
+	lbc.podLister.Store, lbc.podController = framework.NewInformer(
+		&cache.ListWatch{
+			ListFunc:  podListFunc(lbc.client, namespace, keepalivedPeerName),
+			WatchFunc: podWatchFunc(lbc.client, namespace, keepalivedPeerName),
+		},
+		&api.Pod{}, resyncPeriod, podEventHandler)
 	return &lbc, nil
+}
+
+func (lbc *loadBalancerController) buildKeeplivedPeersConfig() (*keepalived.Configuration, error) {
+	pods := lbc.podLister.List()
+	srcIp := os.Getenv("K8S_POD_IP")
+	var peers []string
+	for _, pod := range pods {
+		if pod.(*api.Pod).Status.HostIP != srcIp {
+			peers = append(peers, pod.(*api.Pod).Status.HostIP)
+		}
+	}
+	return &keepalived.Configuration{
+		SrcIp:    srcIp,
+		Peers:    peers,
+		Priority: lbc.keepalivedPriority,
+		Vip:      lbc.virtualIp,
+	}, nil
 }
 
 func ingressListFunc(c *client.Client, ns string) func(api.ListOptions) (runtime.Object, error) {
@@ -194,6 +244,22 @@ func endpointsWatchFunc(c *client.Client, ns string) func(options api.ListOption
 	}
 }
 
+func podListFunc(c *client.Client, ns string, peerName string) func(api.ListOptions) (runtime.Object, error) {
+	return func(opts api.ListOptions) (runtime.Object, error) {
+		return c.Pods(ns).List(api.ListOptions{
+			LabelSelector: labels.SelectorFromSet(map[string]string{"kubernetes.io/ingress.controller.peername": peerName}),
+		})
+	}
+}
+
+func podWatchFunc(c *client.Client, ns string, peerName string) func(options api.ListOptions) (watch.Interface, error) {
+	return func(options api.ListOptions) (watch.Interface, error) {
+		return c.Pods(ns).Watch(api.ListOptions{
+			LabelSelector: labels.SelectorFromSet(map[string]string{"kubernetes.io/ingress.controller.peername": peerName}),
+		})
+	}
+}
+
 func (lbc *loadBalancerController) sync(key string) error {
 	if !lbc.controllersInSync() {
 		time.Sleep(podStoreSyncedPollPeriod)
@@ -202,10 +268,26 @@ func (lbc *loadBalancerController) sync(key string) error {
 	ings := lbc.ingLister.Store.List()
 	haConfig := lbc.haproxy.ReadConfig()
 	hosts := lbc.getHosts(ings)
+
 	return lbc.haproxy.CheckAndReload(haConfig, haproxy.IngressConfig{
 		Hosts: hosts,
 		// TODO: add layer 4
 	})
+}
+
+func (lbc *loadBalancerController) syncKeepalived(key string) error {
+	glog.Infof("syncing keepalived")
+	if !lbc.controllersInSync() {
+		time.Sleep(podStoreSyncedPollPeriod)
+		return fmt.Errorf("deferring sync till endpoints controller has synced")
+	}
+	if keepalivedConfig, err := lbc.buildKeeplivedPeersConfig(); err != nil {
+		glog.Errorf("Failed to fetch keepalived peers: %v", err)
+		return err
+	} else {
+		return lbc.keepalived.CheckAndReload(keepalivedConfig)
+	}
+	return nil
 }
 
 func (lbc *loadBalancerController) getSvc(name string) (*api.Service, error) {
@@ -500,12 +582,17 @@ func (lbc *loadBalancerController) Stop() error {
 func (lbc *loadBalancerController) Run() {
 	glog.Infof("starting haproxy loadbalancer controller")
 	go lbc.haproxy.Start()
+	if lbc.enableKeepalived {
+		go lbc.keepalived.Start()
+	}
 	go lbc.ingController.Run(lbc.stopCh)
 	go lbc.svcController.Run(lbc.stopCh)
 	go lbc.endpController.Run(lbc.stopCh)
+	go lbc.podController.Run(lbc.stopCh)
 
 	go lbc.syncQueue.run(time.Second, lbc.stopCh)
 	go lbc.ingQueue.run(time.Second, lbc.stopCh)
+	go lbc.podQueue.run(time.Second, lbc.stopCh)
 
 	<-lbc.stopCh
 }
