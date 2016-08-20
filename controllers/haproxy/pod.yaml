@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "ingress-test1"
+  labels:
+    run: "ingress"
+spec:
+  hostNetwork: true
+  nodeSelector:
+    kubernetes.io/hostname: i-ijxxxm8i
+  containers:
+    - image: "${prefix}/keepalived:${tag}"
+      imagePullPolicy: "IfNotPresent"
+      name: "haproxy-keepalived"
+      securityContext:
+        privileged: true
+      env:
+        - name: KEEPALIVED_INTERFACE
+          value: "eth1"
+        - name: KEEPALIVED_PRIORITY
+          value: "150"
+        - name: KEEPALIVED_UNICAST_PEERS
+          value: "10.244.1.0"
+        - name: KEEPALIVED_VIRTUAL_IPS
+          value: "10.244.100.100"
+    - image: "${prefix}/haproxy-ingress-controller:${tag}"
+      imagePullPolicy: "Always"
+      name: "haproxy-ingress-controller"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "ingress-test2"
+  labels:
+    run: "ingress"
+spec:
+  hostNetwork: true
+  nodeSelector:
+    kubernetes.io/hostname: i-wx80nuri
+  containers:
+    - image: "${prefix}/keepalived:${tag}"
+      imagePullPolicy: "IfNotPresent"
+      name: "haproxy-keepalived"
+      securityContext:
+        privileged: true
+      env:
+        - name: KEEPALIVED_INTERFACE
+          value: "eth1"
+        - name: KEEPALIVED_PRIORITY
+          value: "100"
+        - name: KEEPALIVED_UNICAST_PEERS
+          value: "10.244.1.1"
+        - name: KEEPALIVED_VIRTUAL_IPS
+          value: "10.244.100.100"
+    - image: "${prefix}/haproxy-ingress-controller:${tag}"
+      imagePullPolicy: "Always"
+      name: "haproxy-ingress-controller"

@@ -13,8 +13,6 @@ global
 defaults
     log global
 
-    load-server-state-from-file global
-
     # Enable session redistribution in case of connection failure.
     option redispatch
 
@@ -32,29 +30,29 @@ defaults
     # Enable HTTP keep-alive from client to server.
     option http-keep-alive
 
-    # Clients should send their full http request in 5s.
-    timeout http-request    5s
+    # Clients should send their full http request in {{ .cfg.httpRequestTimeout }}s.
+    timeout http-request    {{ .cfg.httpRequestTimeout }}s
 
     # Maximum time to wait for a connection attempt to a server to succeed.
-    timeout connect         5s
+    timeout connect         {{ .cfg.connectTimeout }}s
 
     # Maximum inactivity time on the client side.
     # Applies when the client is expected to acknowledge or send data.
-    timeout client          50s
+    timeout client          {{ .cfg.clientTimeout }}s
 
     # Inactivity timeout on the client side for half-closed connections.
     # Applies when the client is expected to acknowledge or send data 
     # while one direction is already shut down.
-    timeout client-fin      50s
+    timeout client-fin      {{ .cfg.clientFinTimeout }}s
 
     # Maximum inactivity time on the server side.
-    timeout server          50s
+    timeout server          {{ .cfg.serverTimeout }}s
 
     # timeout to use with WebSocket and CONNECT
-    timeout tunnel          1h
+    timeout tunnel          {{ .cfg.tunnelTimeout }}s
 
     # Maximum allowed time to wait for a new HTTP request to appear.
-    timeout http-keep-alive 60s
+    timeout http-keep-alive {{ .cfg.httpKeepAliveTimeout }}s
 
     # default traffic mode is http
     # mode is overwritten in case of tcp services
