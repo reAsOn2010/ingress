@@ -3,6 +3,7 @@ package haproxy
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
 	"text/template"
@@ -25,6 +26,7 @@ var (
 			return true
 		},
 		"replaceDot": replaceDot,
+		"buildCerts": buildCerts,
 		// "buildLocation":       buildLocation,
 		// "buildProxyPass":      buildProxyPass,
 		// "buildRateLimitZones": buildRateLimitZones,
@@ -50,14 +52,14 @@ func (ha *Manager) WriteCfg(cfg config.Configuration, ingressCfg IngressConfig) 
 		if err != nil {
 			glog.Errorf("unexpected error:", err)
 		}
-		glog.Infof("NGINX configuration: %v", string(b))
+		glog.Infof("Haproxy configuration: %v", string(b))
 	}
 	buffer := new(bytes.Buffer)
 	err := ha.template.Execute(buffer, conf)
 	if err != nil {
-		glog.V(3).Infof("%v", string(buffer.Bytes()))
 		return false, err
 	}
+	glog.V(3).Infof("%v", string(buffer.Bytes()))
 	changed, err := ha.needsReload(buffer)
 	if err != nil {
 		return false, err
@@ -88,4 +90,20 @@ func toCamelCase(src string) string {
 
 func replaceDot(str string) string {
 	return strings.Replace(str, ".", "-", -1)
+}
+
+func buildCerts(hosts []*Host) string {
+	crts := []string{}
+	for _, host := range hosts {
+		if host.SSLCertificate == "" {
+			continue
+		}
+		tmp := fmt.Sprintf("crt %s", host.SSLCertificate)
+		crts = append(crts, tmp)
+	}
+	return strings.Join(crts, " ")
+}
+
+func (ha *Manager) HasValidCert(hosts []*Host) bool {
+	return buildCerts(hosts) != ""
 }

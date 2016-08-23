@@ -2,11 +2,14 @@ package config
 
 const ()
 
-var ()
+var (
+	SSLDirectory = "/usr/local/etc/haproxy/ssl"
+)
 
 // Configuration represents the content of haproxy.cfg file
 type Configuration struct {
 	EnableSyslog         bool `structs:"enableSyslog,omitempty"`
+	EnableSSL            bool `structs:"enableSSL,omitempty"`
 	HttpRequestTimeout   int  `structs:"httpRequestTimeout"`
 	ConnectTimeout       int  `structs:"connectTimeout"`
 	ClientTimeout        int  `structs:"clientTimeout"`
@@ -21,6 +24,7 @@ type Configuration struct {
 func NewDefault() Configuration {
 	cfg := Configuration{
 		EnableSyslog:         false,
+		EnableSSL:            false,
 		HttpRequestTimeout:   5,
 		ConnectTimeout:       5,
 		ClientTimeout:        50,
