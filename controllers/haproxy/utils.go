@@ -1,6 +1,8 @@
 package main
 
 import (
+	"io/ioutil"
+	"strings"
 	"time"
 
 	"github.com/golang/glog"
@@ -16,6 +18,10 @@ type StoreToIngressLister struct {
 	cache.Store
 }
 
+type StoreToSecretsLister struct {
+	cache.Store
+}
+
 type ingAnnotations map[string]string
 
 func (ing ingAnnotations) ingressClass() string {
@@ -28,8 +34,7 @@ func (ing ingAnnotations) ingressClass() string {
 
 const (
 	// ingressClassKey picks a specific "class" for the Ingress. The controller
-	// only processes Ingresses with this annotation either unset, or set
-	// to either nginxIngressClass or the empty string.
+	// only processes Ingresses with this annotation.
 	ingressClassKey     = "kubernetes.io/ingress.class"
 	haproxyIngressClass = "haproxy"
 )
@@ -104,4 +109,62 @@ func NewTaskQueue(syncFn func(string) error) *taskQueue {
 		sync:       syncFn,
 		workerDone: make(chan struct{}),
 	}
+}
+
+const (
+	snakeOilPem = "/etc/ssl/certs/ssl-cert-snakeoil.pem"
+	snakeOilKey = "/etc/ssl/private/ssl-cert-snakeoil.key"
+)
+
+// getFakeSSLCert returns the snake oil ssl certificate created by the command
+// make-ssl-cert generate-default-snakeoil --force-overwrite
+func getFakeSSLCert() (string, string) {
+	cert, err := ioutil.ReadFile(snakeOilPem)
+	if err != nil {
+		return "", ""
+	}
+
+	key, err := ioutil.ReadFile(snakeOilKey)
+	if err != nil {
+		return "", ""
+	}
+
+	return string(cert), string(key)
+}
+
+func isHostValid(host string, cns []string) bool {
+	for _, cn := range cns {
+		if matchHostnames(cn, host) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func matchHostnames(pattern, host string) bool {
+	host = strings.TrimSuffix(host, ".")
+	pattern = strings.TrimSuffix(pattern, ".")
+
+	if len(pattern) == 0 || len(host) == 0 {
+		return false
+	}
+
+	patternParts := strings.Split(pattern, ".")
+	hostParts := strings.Split(host, ".")
+
+	if len(patternParts) != len(hostParts) {
+		return false
+	}
+
+	for i, patternPart := range patternParts {
+		if i == 0 && patternPart == "*" {
+			continue
+		}
+		if patternPart != hostParts[i] {
+			return false
+		}
+	}
+
+	return true
 }

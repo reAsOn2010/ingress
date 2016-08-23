@@ -4,12 +4,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/golang/glog"
 	"github.com/reAsOn2010/ingress/controllers/haproxy/haproxy"
+	"github.com/reAsOn2010/ingress/controllers/haproxy/haproxy/rewrite"
 
 	"k8s.io/kubernetes/pkg/api"
 	podutil "k8s.io/kubernetes/pkg/api/pod"
@@ -25,6 +28,7 @@ import (
 )
 
 const (
+	defBackendName           = "default-backend"
 	defHostName              = "_"
 	podStoreSyncedPollPeriod = 1 * time.Second
 	rootLocation             = "/"
@@ -63,9 +67,11 @@ type loadBalancerController struct {
 	ingController  *framework.Controller
 	svcController  *framework.Controller
 	endpController *framework.Controller
+	secrController *framework.Controller
 	ingLister      StoreToIngressLister
 	svcLister      cache.StoreToServiceLister
 	endpLister     cache.StoreToEndpointsLister
+	secrLister     StoreToSecretsLister
 	haproxy        *haproxy.Manager
 	syncQueue      *taskQueue
 	ingQueue       *taskQueue
@@ -123,6 +129,32 @@ func newLoadBalancerController(kubeClient *client.Client, resyncPeriod time.Dura
 		},
 	}
 
+	secrEventHandler := framework.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			addSecr := obj.(*api.Secret)
+			if lbc.secrReferenced(addSecr.Namespace, addSecr.Name) {
+				lbc.recorder.Eventf(addSecr, api.EventTypeNormal, "CREATE", fmt.Sprintf("%s/%s", addSecr.Namespace, addSecr.Name))
+				lbc.syncQueue.enqueue(obj)
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			delSecr := obj.(*api.Secret)
+			if lbc.secrReferenced(delSecr.Namespace, delSecr.Name) {
+				lbc.recorder.Eventf(delSecr, api.EventTypeNormal, "DELETE", fmt.Sprintf("%s/%s", delSecr.Namespace, delSecr.Name))
+				lbc.syncQueue.enqueue(obj)
+			}
+		},
+		UpdateFunc: func(old, cur interface{}) {
+			if !reflect.DeepEqual(old, cur) {
+				upSecr := cur.(*api.Secret)
+				if lbc.secrReferenced(upSecr.Namespace, upSecr.Name) {
+					lbc.recorder.Eventf(upSecr, api.EventTypeNormal, "UPDATE", fmt.Sprintf("%s/%s", upSecr.Namespace, upSecr.Name))
+					lbc.syncQueue.enqueue(cur)
+				}
+			}
+		},
+	}
+
 	eventHandler := framework.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			lbc.syncQueue.enqueue(obj)
@@ -149,6 +181,12 @@ func newLoadBalancerController(kubeClient *client.Client, resyncPeriod time.Dura
 			WatchFunc: serviceWatchFunc(lbc.client, namespace),
 		},
 		&api.Service{}, resyncPeriod, framework.ResourceEventHandlerFuncs{})
+	lbc.secrLister.Store, lbc.secrController = framework.NewInformer(
+		&cache.ListWatch{
+			ListFunc:  secretsListFunc(lbc.client, namespace),
+			WatchFunc: secretsWatchFunc(lbc.client, namespace),
+		},
+		&api.Secret{}, resyncPeriod, secrEventHandler)
 	lbc.endpLister.Store, lbc.endpController = framework.NewInformer(
 		&cache.ListWatch{
 			ListFunc:  endpointsListFunc(lbc.client, namespace),
@@ -194,6 +232,18 @@ func endpointsWatchFunc(c *client.Client, ns string) func(options api.ListOption
 	}
 }
 
+func secretsListFunc(c *client.Client, ns string) func(api.ListOptions) (runtime.Object, error) {
+	return func(opts api.ListOptions) (runtime.Object, error) {
+		return c.Secrets(ns).List(opts)
+	}
+}
+
+func secretsWatchFunc(c *client.Client, ns string) func(options api.ListOptions) (watch.Interface, error) {
+	return func(options api.ListOptions) (watch.Interface, error) {
+		return c.Secrets(ns).Watch(options)
+	}
+}
+
 func (lbc *loadBalancerController) sync(key string) error {
 	if !lbc.controllersInSync() {
 		time.Sleep(podStoreSyncedPollPeriod)
@@ -201,9 +251,11 @@ func (lbc *loadBalancerController) sync(key string) error {
 	}
 	ings := lbc.ingLister.Store.List()
 	haConfig := lbc.haproxy.ReadConfig()
-	hosts := lbc.getHosts(ings)
+	hosts, backends := lbc.getHostsAndBackends(ings)
+	haConfig.EnableSSL = lbc.haproxy.HasValidCert(hosts)
 	return lbc.haproxy.CheckAndReload(haConfig, haproxy.IngressConfig{
-		Hosts: hosts,
+		Hosts:    hosts,
+		Backends: backends,
 		// TODO: add layer 4
 	})
 }
@@ -219,79 +271,129 @@ func (lbc *loadBalancerController) getSvc(name string) (*api.Service, error) {
 	return svcObj.(*api.Service), nil
 }
 
-func (lbc *loadBalancerController) getHosts(data []interface{}) map[string]*haproxy.Host {
+func (lbc *loadBalancerController) getHostsAndBackends(data []interface{}) ([]*haproxy.Host, []*haproxy.Backend) {
+	backends := lbc.createBackends(data)
+	backends[defBackendName] = lbc.getDefaultBackend()
 	hosts := lbc.createHosts(data)
+
+	if _, ok := hosts[defHostName]; !ok {
+		hosts[defHostName] = &haproxy.Host{
+			Name: defHostName,
+			Locations: []*haproxy.Location{{
+				Path:         rootLocation,
+				IsDefBackend: true,
+				Backend:      lbc.getDefaultBackend(),
+			},
+			},
+		}
+	}
+
 	for _, ingIf := range data {
 		ing := ingIf.(*extensions.Ingress)
-
 		for _, rule := range ing.Spec.Rules {
-			if rule.IngressRuleValue.HTTP == nil {
-				continue
-			}
 			hostname := rule.Host
 			if hostname == "" {
 				hostname = defHostName
 			}
 			host := hosts[hostname]
 			if host == nil {
+				glog.Errorf("Impossible!")
 				host = hosts["_"]
 			}
 			for _, path := range rule.HTTP.Paths {
-				haPath := path.Path
-				// if there's no path defined we assume /
-				if haPath == "" {
+				backendName := fmt.Sprintf("%v-%v-%v", ing.GetNamespace(), path.Backend.ServiceName, path.Backend.ServicePort.String())
+				backend := backends[backendName]
+				locationPath := path.Path
+				if locationPath == "" {
 					lbc.recorder.Eventf(ing, api.EventTypeWarning, "MAPPING",
-						"Ingress rule '%v/%v' contains no path definition. Assuming /",
-						ing.GetNamespace(), ing.GetName())
-					haPath = rootLocation
+						"Ingress rule '%v/%v' contains no path definition. Assuming /", ing.GetNamespace(), ing.GetName())
+					locationPath = rootLocation
 				}
-				addBackend := true
-				for _, backend := range host.Backends {
-					if backend.Path == rootLocation && haPath == rootLocation && backend.IsDefBackend {
-						if svc, err := lbc.getSvc(fmt.Sprintf("%s/%s", ing.GetNamespace(), path.Backend.ServiceName)); err != nil {
-							lbc.recorder.Eventf(ing, api.EventTypeWarning, "MAPPING",
-								"Fetch service failed of '%v/%v'", ing.GetNamespace(), path.Backend.ServiceName)
-						} else {
-							backend.Endpoints = lbc.getEndpoints(svc, path.Backend.ServicePort, api.ProtocolTCP)
-							backend.HostName = hostname
-							backend.Algorithm = "leastconn"
-							backend.SessionAffinity = false
-							backend.CookieStickySession = false
-						}
-						addBackend = false
+
+				rewrite, err := rewrite.ParseAnnotations(path.Path, ing)
+				if err != nil {
+					glog.V(3).Infof("error parsing rewrite annotations for Ingress rule %v/%v: %v", ing.GetNamespace(), ing.GetName(), err)
+				} else {
+					backend.RewriteRules = append(backend.RewriteRules, rewrite)
+				}
+				addLoc := true
+				for _, loc := range host.Locations {
+					if loc.Path == rootLocation && locationPath == rootLocation && loc.IsDefBackend {
+						loc.Backend = backend
+						addLoc = false
 						continue
 					}
 
-					if backend.Path == haPath {
+					if loc.Path == locationPath {
 						lbc.recorder.Eventf(ing, api.EventTypeWarning, "MAPPING",
-							"Path '%v' already defined in another Ingress rule", haPath)
-						addBackend = false
+							"Path '%v' already defined in another Ingress rule", locationPath)
+						addLoc = false
 						break
 					}
 				}
-				if addBackend {
-					if svc, err := lbc.getSvc(fmt.Sprintf("%s/%s", ing.GetNamespace(), path.Backend.ServiceName)); err != nil {
-						lbc.recorder.Eventf(ing, api.EventTypeWarning, "MAPPING",
-							"Fetch service failed of '%v/%v'", ing.GetNamespace(), path.Backend.ServiceName)
-					} else {
-						host.Backends = append(host.Backends, &haproxy.Backend{
-							Path:                haPath,
-							Endpoints:           lbc.getEndpoints(svc, path.Backend.ServicePort, api.ProtocolTCP),
-							HostName:            hostname,
-							Algorithm:           "leastconn",
-							SessionAffinity:     false,
-							CookieStickySession: false,
-						})
-					}
+
+				if addLoc {
+					host.Locations = append(host.Locations, &haproxy.Location{
+						Path:    locationPath,
+						Backend: backend,
+					})
 				}
 			}
 		}
 	}
-	return hosts
+
+	// TODO: find a way to make this more readable
+	// The structs must be ordered to always generate the same file
+	// if the content does not change.
+	aBackends := make([]*haproxy.Backend, 0, len(backends))
+	for _, value := range backends {
+		if len(value.Endpoints) == 0 {
+			glog.Warningf("backend %v does not have any active endpoints. Using default endpoint", value.Name)
+			value.Endpoints = append(value.Endpoints, haproxy.NewDefaultEp())
+		}
+		sort.Sort(haproxy.EndpointByAddrPort(value.Endpoints))
+		aBackends = append(aBackends, value)
+	}
+	sort.Sort(haproxy.BackendByName(aBackends))
+
+	aHosts := make([]*haproxy.Host, 0, len(hosts))
+	for _, value := range hosts {
+		sort.Sort(haproxy.LocationByPath(value.Locations))
+		aHosts = append(aHosts, value)
+	}
+	sort.Sort(haproxy.HostByName(aHosts))
+
+	return aHosts, aBackends
 }
 
 func (lbc *loadBalancerController) createHosts(data []interface{}) map[string]*haproxy.Host {
-	hosts := make(map[string]*haproxy.Host)
+	hosts := map[string]*haproxy.Host{}
+
+	pems := lbc.getPemsFromIngress(data)
+
+	var haCert haproxy.SSLCert
+	var err error
+
+	cert, key := getFakeSSLCert()
+	haCert, err = lbc.haproxy.AddOrUpdateCertAndKey("system-snake-oil-certificate", cert, key)
+
+	locs := []*haproxy.Location{}
+	locs = append(locs, &haproxy.Location{
+		Path:         rootLocation,
+		IsDefBackend: true,
+		Backend:      lbc.getDefaultBackend(),
+	})
+	hosts[defHostName] = &haproxy.Host{Name: defHostName, Locations: locs}
+
+	if err == nil {
+		pems[defHostName] = haCert
+		hosts[defHostName].SSL = true
+		hosts[defHostName].SSLCertificate = haCert.PemFileName
+		hosts[defHostName].SSLCertificateKey = haCert.PemFileName
+		hosts[defHostName].SSLPemChecksum = haCert.PemSHA
+	} else {
+		glog.Warningf("unexpected error reading default SSL certificate: %v", err)
+	}
 
 	for _, ingIf := range data {
 		ing := ingIf.(*extensions.Ingress)
@@ -302,29 +404,146 @@ func (lbc *loadBalancerController) createHosts(data []interface{}) map[string]*h
 				hostname = defHostName
 			}
 			if _, ok := hosts[hostname]; !ok {
-				var backends []*haproxy.Backend
-				backends = append(backends, &haproxy.Backend{
-					HostName:     hostname,
+				locs := []*haproxy.Location{}
+				locs = append(locs, &haproxy.Location{
 					Path:         rootLocation,
 					IsDefBackend: true,
-					Endpoints:    haproxy.NewDefaultEps(),
+					Backend:      lbc.getDefaultBackend(),
 				})
-				hosts[hostname] = &haproxy.Host{Name: hostname, Backends: backends}
+				hosts[hostname] = &haproxy.Host{Name: hostname, Locations: locs}
+			}
+			if haCert, ok := pems[hostname]; ok {
+				host := hosts[hostname]
+				host.SSL = true
+				host.SSLCertificate = haCert.PemFileName
+				host.SSLCertificateKey = haCert.PemFileName
+				host.SSLPemChecksum = haCert.PemSHA
 			}
 		}
 	}
 	return hosts
 }
 
-func (lbc *loadBalancerController) getEndpoints(s *api.Service, servicePort intstr.IntOrString, proto api.Protocol) []*haproxy.Endpoint {
+func (lbc *loadBalancerController) createBackends(data []interface{}) map[string]*haproxy.Backend {
+	backends := map[string]*haproxy.Backend{}
+	for _, ingIf := range data {
+		ing := ingIf.(*extensions.Ingress)
+
+		for _, rule := range ing.Spec.Rules {
+			if rule.IngressRuleValue.HTTP == nil {
+				continue
+			}
+			for _, path := range rule.HTTP.Paths {
+				name := fmt.Sprintf("%v-%v-%v", ing.GetNamespace(), path.Backend.ServiceName, path.Backend.ServicePort.String())
+				if _, ok := backends[name]; ok {
+					continue
+				}
+				glog.V(3).Infof("creating backend %v", name)
+				backend := haproxy.Backend{
+					RewriteRules: []*rewrite.Rewrite{},
+				}
+				if svc, err := lbc.getSvc(fmt.Sprintf("%s/%s", ing.GetNamespace(), path.Backend.ServiceName)); err != nil {
+					lbc.recorder.Eventf(ing, api.EventTypeWarning, "MAPPING",
+						"Fetch service failed of '%v/%v'", ing.GetNamespace(), path.Backend.ServiceName)
+				} else {
+					backend.Endpoints = lbc.getEndpoints(svc, path.Backend.ServicePort, api.ProtocolTCP)
+				}
+				backend.Name = name
+				backend.Algorithm = "leastconn"
+				backend.SessionAffinity = false
+				backend.CookieStickySession = false
+				backends[name] = &backend
+			}
+		}
+	}
+	return backends
+}
+
+func (lbc *loadBalancerController) getPemsFromIngress(data []interface{}) map[string]haproxy.SSLCert {
+	pems := make(map[string]haproxy.SSLCert)
+
+	for _, ingIf := range data {
+		ing := ingIf.(*extensions.Ingress)
+		for _, tls := range ing.Spec.TLS {
+			secretName := tls.SecretName
+			secretKey := fmt.Sprintf("%s/%s", ing.Namespace, secretName)
+			haCert, err := lbc.getPermCertificate(secretKey)
+			if err != nil {
+				glog.Warningf("%v", err)
+				continue
+			}
+			for _, host := range tls.Hosts {
+				if isHostValid(host, haCert.CN) {
+					pems[host] = haCert
+				} else {
+					glog.Warningf("SSL Certificate stored in secret %v is not valid for the host %v defined in the Ingress rule %v", secretName, host, ing.Name)
+				}
+			}
+		}
+	}
+	return pems
+}
+
+func (lbc *loadBalancerController) getPermCertificate(secretName string) (haproxy.SSLCert, error) {
+	secretInterface, exists, err := lbc.secrLister.Store.GetByKey(secretName)
+	if err != nil {
+		return haproxy.SSLCert{}, fmt.Errorf("Error retriving secret %v: %v", secretName, err)
+	}
+	if !exists {
+		return haproxy.SSLCert{}, fmt.Errorf("Secret %v does not exist", secretName)
+	}
+
+	secret := secretInterface.(*api.Secret)
+	cert, ok := secret.Data[api.TLSCertKey]
+	if !ok {
+		return haproxy.SSLCert{}, fmt.Errorf("Secret %v has no cert", secretName)
+	}
+	key, ok := secret.Data[api.TLSPrivateKeyKey]
+	if !ok {
+		return haproxy.SSLCert{}, fmt.Errorf("Secret %v has no private key", secretName)
+	}
+	nsSecName := strings.Replace(secretName, "/", "-", -1)
+	return lbc.haproxy.AddOrUpdateCertAndKey(nsSecName, string(cert), string(key))
+}
+
+// check if secret is referenced in this controller's config
+func (lbc *loadBalancerController) secrReferenced(namespace string, name string) bool {
+	for _, ingIf := range lbc.ingLister.Store.List() {
+		ing := ingIf.(*extensions.Ingress)
+		if ing.Namespace != namespace {
+			continue
+		}
+		for _, tls := range ing.Spec.TLS {
+			if tls.SecretName == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (lbc *loadBalancerController) getDefaultBackend() *haproxy.Backend {
+	backend := &haproxy.Backend{
+		Name:                defBackendName,
+		Algorithm:           "leastconn",
+		SessionAffinity:     false,
+		CookieStickySession: false,
+		Endpoints: []haproxy.Endpoint{
+			haproxy.NewDefaultEp(),
+		},
+	}
+	return backend
+}
+
+func (lbc *loadBalancerController) getEndpoints(s *api.Service, servicePort intstr.IntOrString, proto api.Protocol) []haproxy.Endpoint {
 	glog.V(3).Infof("getting endpoints for service %v/%v and port %v", s.Namespace, s.Name, servicePort.String())
 	ep, err := lbc.endpLister.GetServiceEndpoints(s)
 	if err != nil {
 		glog.Warningf("unexpected error obtaining service endpoints: %v", err)
-		return []*haproxy.Endpoint{}
+		return []haproxy.Endpoint{}
 	}
 
-	endpoints := []*haproxy.Endpoint{}
+	endpoints := []haproxy.Endpoint{}
 
 	for _, ss := range ep.Subsets {
 		for _, epPort := range ss.Ports {
@@ -375,10 +594,10 @@ func (lbc *loadBalancerController) getEndpoints(s *api.Service, servicePort ints
 
 			for _, epAddress := range ss.Addresses {
 				endpoint := haproxy.Endpoint{
-					Host: epAddress.IP,
+					Addr: epAddress.IP,
 					Port: fmt.Sprintf("%v", targetPort),
 				}
-				endpoints = append(endpoints, &endpoint)
+				endpoints = append(endpoints, endpoint)
 			}
 		}
 	}
@@ -503,6 +722,7 @@ func (lbc *loadBalancerController) Run() {
 	go lbc.ingController.Run(lbc.stopCh)
 	go lbc.svcController.Run(lbc.stopCh)
 	go lbc.endpController.Run(lbc.stopCh)
+	go lbc.secrController.Run(lbc.stopCh)
 
 	go lbc.syncQueue.run(time.Second, lbc.stopCh)
 	go lbc.ingQueue.run(time.Second, lbc.stopCh)

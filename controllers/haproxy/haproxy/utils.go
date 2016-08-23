@@ -37,7 +37,7 @@ func (ha *Manager) needsReload(data *bytes.Buffer) (bool, error) {
 		}
 
 		if glog.V(2) {
-			glog.Infof("NGINX configuration diff a/%s b/%s\n", filename, filename)
+			glog.Infof("Haproxy configuration diff a/%s b/%s\n", filename, filename)
 			glog.Infof("%v", string(dData))
 		}
 
