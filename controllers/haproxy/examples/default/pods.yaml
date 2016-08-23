@@ -7,7 +7,7 @@ metadata:
 spec:
   hostNetwork: true
   nodeSelector:
-    kubernetes.io/hostname: i-ijxxxm8i
+    kubernetes.io/hostname: ${host1}
   containers:
     - image: "${prefix}/keepalived:${tag}"
       imagePullPolicy: "IfNotPresent"
@@ -36,7 +36,7 @@ metadata:
 spec:
   hostNetwork: true
   nodeSelector:
-    kubernetes.io/hostname: i-wx80nuri
+    kubernetes.io/hostname: ${host2}
   containers:
     - image: "${prefix}/keepalived:${tag}"
       imagePullPolicy: "IfNotPresent"
