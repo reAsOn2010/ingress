@@ -88,17 +88,10 @@ func (ha *Manager) commonNames(pemFileName string) ([]string, error) {
 // in order to find a file with the name dhparam.pem. If such file exists it will
 // returns the path. If not it just returns an empty string
 func (ha *Manager) SearchDHParamFile(baseDir string) string {
-	files, _ := ioutil.ReadDir(baseDir)
-	for _, file := range files {
-		if !file.IsDir() {
-			continue
-		}
-
-		dhPath := fmt.Sprintf("%v/%v/dhparam.pem", baseDir, file.Name())
-		if _, err := os.Stat(dhPath); err == nil {
-			glog.Infof("using file '%v' for parameter ssl_dhparam", dhPath)
-			return dhPath
-		}
+	dhPath := fmt.Sprintf("%v/dhparam.pem", baseDir)
+	if _, err := os.Stat(dhPath); err == nil {
+		glog.Infof("using file '%v' for parameter ssl_dhparam", dhPath)
+		return dhPath
 	}
 
 	glog.Warning("no file dhparam.pem found in secrets")

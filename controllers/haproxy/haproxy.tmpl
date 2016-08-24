@@ -3,6 +3,9 @@
 global
     daemon
     stats socket /tmp/haproxy
+    {{ if .sslDHParam }}
+    ssl-dh-param-file {{ .sslDHParam }}
+    {{ end }}
 
 {{ if .cfg.enableSyslog }}
     # log using a syslog socket

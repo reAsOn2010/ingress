@@ -47,6 +47,7 @@ func (ha *Manager) WriteCfg(cfg config.Configuration, ingressCfg IngressConfig) 
 	conf := make(map[string]interface{})
 	conf["services"] = ingressCfg
 	conf["cfg"] = fixKeyNames(structs.Map(cfg))
+	conf["sslDHParam"] = ha.sslDHParam
 	if glog.V(3) {
 		b, err := json.Marshal(conf)
 		if err != nil {

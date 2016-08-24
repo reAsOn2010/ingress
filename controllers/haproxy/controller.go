@@ -467,7 +467,7 @@ func (lbc *loadBalancerController) getPemsFromIngress(data []interface{}) map[st
 		for _, tls := range ing.Spec.TLS {
 			secretName := tls.SecretName
 			secretKey := fmt.Sprintf("%s/%s", ing.Namespace, secretName)
-			haCert, err := lbc.getPermCertificate(secretKey)
+			haCert, err := lbc.getPemCertificate(secretKey)
 			if err != nil {
 				glog.Warningf("%v", err)
 				continue
@@ -484,7 +484,7 @@ func (lbc *loadBalancerController) getPemsFromIngress(data []interface{}) map[st
 	return pems
 }
 
-func (lbc *loadBalancerController) getPermCertificate(secretName string) (haproxy.SSLCert, error) {
+func (lbc *loadBalancerController) getPemCertificate(secretName string) (haproxy.SSLCert, error) {
 	secretInterface, exists, err := lbc.secrLister.Store.GetByKey(secretName)
 	if err != nil {
 		return haproxy.SSLCert{}, fmt.Errorf("Error retriving secret %v: %v", secretName, err)
